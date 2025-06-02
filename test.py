@@ -3,6 +3,7 @@ import logging
 from flask import Flask, request, jsonify, render_template
 import requests
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 from flask_cors import CORS
 
 # --- Thiết lập Flask ---
@@ -44,12 +45,11 @@ def allowed_file(filename):
 
 def transcribe_with_deepgram(audio_bytes: bytes, ext: str) -> str:
     """
-    Gửi audio (đã có header WAV) lên Deepgram và trả về transcript.
-    Phần mở rộng ext chỉ dùng để xác định Content-Type: audio/{ext}
+    Gửi audio (bytes) lên Deepgram và trả về transcript.
+    ext: phần mở rộng file (vd: 'wav', 'mp3', ...)
     """
     content_type = f'audio/{ext}'
     try:
-        # Gửi trực tiếp bytes vào requests
         response = session.post(
             DEEPGRAM_ENDPOINT,
             data=audio_bytes,
@@ -60,11 +60,11 @@ def transcribe_with_deepgram(audio_bytes: bytes, ext: str) -> str:
                 'punctuate': 'true',
                 'utterances': 'true'
             },
-            timeout=10  # Timeout 10s, có thể điều chỉnh
+            timeout=10  # Timeout 10s
         )
         response.raise_for_status()
         data = response.json()
-        # Trả transcript
+        # Trả về transcript thuần túy
         return data['results']['channels'][0]['alternatives'][0]['transcript']
     except requests.exceptions.RequestException as e:
         logging.error(f"[Deepgram] Request failed: {e}")
@@ -77,13 +77,13 @@ def transcribe_with_deepgram(audio_bytes: bytes, ext: str) -> str:
 # --- Routes ---
 @app.route('/')
 def index():
-    # Trả về HTML nếu truy cập root
-    return render_template('test.html')  # Đảm bảo có file templates/test.html
+    # Nếu cần giao diện upload ở browser, trả test.html
+    return render_template('test.html')
 
 
 @app.route('/upload', methods=['POST'])
 def upload_audio():
-    # 1. Kiểm tra file
+    # 1. Kiểm tra có file trong form-data không
     if 'file' not in request.files:
         return jsonify({'error': 'Không có file được tải lên'}), 400
 
@@ -94,23 +94,22 @@ def upload_audio():
     if not allowed_file(f.filename):
         return jsonify({'error': 'Định dạng file không được hỗ trợ'}), 400
 
-    # 2. Đọc vào memory
+    # 2. Đọc file vào memory
     try:
         audio_bytes = f.read()
         if len(audio_bytes) == 0:
             return jsonify({'error': 'File rỗng'}), 400
 
-        # Lấy ext để xác định Content-Type
         ext = secure_filename(f.filename).rsplit('.', 1)[1].lower()
     except Exception as e:
         logging.error(f"[FILE] Error reading file: {e}")
         return jsonify({'error': 'Lỗi đọc file'}), 500
 
-    # 3. Gọi Deepgram (đồng bộ)
+    # 3. Gọi Deepgram
     try:
         transcript = transcribe_with_deepgram(audio_bytes, ext)
     except RuntimeError as e:
-        # transcribe_with_deepgram raise RuntimeError với message chi tiết
+        # Lỗi kết nối hoặc xử lý Deepgram
         return jsonify({'error': str(e)}), 502
     except Exception as e:
         logging.error(f"[TRANSCRIBE] Unexpected error: {e}")
@@ -120,15 +119,20 @@ def upload_audio():
     return jsonify({'transcript': transcript}), 200
 
 
-# Bắt lỗi route không tồn tại: luôn trả JSON, không trả HTML
+# --- Xử lý lỗi chung để luôn trả JSON ---
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_file(e):
+    return jsonify({'error': 'File quá lớn (tối đa 5MB)'}), 413
+
+
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({'error': 'Endpoint không tồn tại'}), 404
 
 
-@app.errorhandler(413)
-def too_large(e):
-    return jsonify({'error': 'File quá lớn (tối đa 5MB)'}), 413
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({'error': 'Phương thức không cho phép'}), 405
 
 
 @app.errorhandler(500)
@@ -137,5 +141,5 @@ def internal_error(e):
 
 
 if __name__ == '__main__':
-    # Khi chạy local/testing
+    # Khi chạy local
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
