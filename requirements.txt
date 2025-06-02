@@ -1,4 +1,4 @@
 Flask
-speechrecognition
 werkzeug
 requests
+flask-cors
