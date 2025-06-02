@@ -4,8 +4,6 @@ from flask import Flask, request, jsonify, render_template
 import requests
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
-from io import BytesIO
-import concurrent.futures
 
 # --- Thiết lập Flask ---
 app = Flask(__name__, template_folder="templates")
@@ -13,7 +11,7 @@ app = Flask(__name__, template_folder="templates")
 # Giới hạn kích thước file upload (5MB)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB
 
-# Bật CORS
+# Bật CORS cho route /upload
 CORS(app, resources={r"/upload": {"origins": "*"}})
 
 # Logging cơ bản
@@ -27,9 +25,6 @@ DEEPGRAM_API_KEY = "95e26fe061960fecb8fc532883f92af0641b89d0"
 DEEPGRAM_ENDPOINT = "https://api.deepgram.com/v1/listen"
 ALLOWED_EXTENSIONS = {'wav', 'mp3', 'm4a', 'flac'}
 
-# Tạo thread pool cho các tác vụ I/O bound
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-
 # Tạo session tái sử dụng với connection pooling
 session = requests.Session()
 session.headers.update({
@@ -42,81 +37,105 @@ session.mount('https://', requests.adapters.HTTPAdapter(
     max_retries=3
 ))
 
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-async def transcribe_with_deepgram(audio_bytes: bytes, ext: str) -> str:
-    """Gửi audio lên Deepgram và trả về transcript (async)"""
+
+def transcribe_with_deepgram(audio_bytes: bytes, ext: str) -> str:
+    """
+    Gửi audio (đã có header WAV) lên Deepgram và trả về transcript.
+    Phần mở rộng ext chỉ dùng để xác định Content-Type: audio/{ext}
+    """
     content_type = f'audio/{ext}'
-    
     try:
-        with BytesIO(audio_bytes) as audio_stream:
-            response = session.post(
-                DEEPGRAM_ENDPOINT,
-                data=audio_stream,
-                headers={'Content-Type': content_type},
-                params={
-                    'language': 'vi',
-                    'model': 'nova-2',
-                    'punctuate': 'true',
-                    'utterances': 'true'
-                },
-                timeout=10
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            return data['results']['channels'][0]['alternatives'][0]['transcript']
-            
+        # Gửi trực tiếp bytes vào requests
+        response = session.post(
+            DEEPGRAM_ENDPOINT,
+            data=audio_bytes,
+            headers={'Content-Type': content_type},
+            params={
+                'language': 'vi',
+                'model': 'nova-2',
+                'punctuate': 'true',
+                'utterances': 'true'
+            },
+            timeout=10  # Timeout 10s, có thể điều chỉnh
+        )
+        response.raise_for_status()
+        data = response.json()
+        # Trả transcript
+        return data['results']['channels'][0]['alternatives'][0]['transcript']
     except requests.exceptions.RequestException as e:
-        logging.error(f"Deepgram request failed: {str(e)}")
-        raise RuntimeError(f"Lỗi kết nối Deepgram: {str(e)}")
+        logging.error(f"[Deepgram] Request failed: {e}")
+        raise RuntimeError(f"Lỗi kết nối Deepgram: {e}")
     except Exception as e:
-        logging.error(f"Deepgram processing error: {str(e)}")
+        logging.error(f"[Deepgram] Processing error: {e}")
         raise RuntimeError("Lỗi xử lý kết quả từ Deepgram")
 
+
+# --- Routes ---
 @app.route('/')
 def index():
-    return render_template('test.html')
+    # Trả về HTML nếu truy cập root
+    return render_template('test.html')  # Đảm bảo có file templates/test.html
+
 
 @app.route('/upload', methods=['POST'])
 def upload_audio():
-    # Kiểm tra file
+    # 1. Kiểm tra file
     if 'file' not in request.files:
         return jsonify({'error': 'Không có file được tải lên'}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
+
+    f = request.files['file']
+    if f.filename == '':
         return jsonify({'error': 'Không có file được chọn'}), 400
-    
-    if not allowed_file(file.filename):
+
+    if not allowed_file(f.filename):
         return jsonify({'error': 'Định dạng file không được hỗ trợ'}), 400
-    
-    # Đọc file vào memory
+
+    # 2. Đọc vào memory
     try:
-        audio_bytes = file.read()
+        audio_bytes = f.read()
         if len(audio_bytes) == 0:
             return jsonify({'error': 'File rỗng'}), 400
-            
-        ext = file.filename.rsplit('.', 1)[1].lower()
+
+        # Lấy ext để xác định Content-Type
+        ext = secure_filename(f.filename).rsplit('.', 1)[1].lower()
     except Exception as e:
-        logging.error(f"File read error: {str(e)}")
+        logging.error(f"[FILE] Error reading file: {e}")
         return jsonify({'error': 'Lỗi đọc file'}), 500
-    
-    # Xử lý bất đồng bộ
+
+    # 3. Gọi Deepgram (đồng bộ)
     try:
-        # Sử dụng thread pool để không block main thread
-        future = executor.submit(transcribe_with_deepgram, audio_bytes, ext)
-        transcript = future.result(timeout=15)  # Timeout 15s
-    except concurrent.futures.TimeoutError:
-        logging.error("Deepgram request timeout")
-        return jsonify({'error': 'Timeout khi xử lý audio'}), 504
+        transcript = transcribe_with_deepgram(audio_bytes, ext)
+    except RuntimeError as e:
+        # transcribe_with_deepgram raise RuntimeError với message chi tiết
+        return jsonify({'error': str(e)}), 502
     except Exception as e:
-        logging.error(f"Transcription error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-    
+        logging.error(f"[TRANSCRIBE] Unexpected error: {e}")
+        return jsonify({'error': 'Lỗi không xác định khi xử lý audio'}), 500
+
+    # 4. Trả kết quả JSON
     return jsonify({'transcript': transcript}), 200
 
+
+# Bắt lỗi route không tồn tại: luôn trả JSON, không trả HTML
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Endpoint không tồn tại'}), 404
+
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'error': 'File quá lớn (tối đa 5MB)'}), 413
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': 'Lỗi server'}), 500
+
+
 if __name__ == '__main__':
-    # Production nên dùng Gunicorn với worker threads
+    # Khi chạy local/testing
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
